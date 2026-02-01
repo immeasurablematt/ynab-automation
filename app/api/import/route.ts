@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import * as ynab from "ynab";
-import { ynabReadyToJson } from "@/lib/normalize";
+import { ynabReadyToJson, dedupeYnabReadyRows } from "@/lib/normalize";
 
 const DAYS_TOLERANCE = parseInt(process.env.YNAB_DUPLICATE_DAYS || "5", 10);
+const PAGE_SIZE = 500;
 
 export async function POST(request: Request) {
   const token = process.env.YNAB_ACCESS_TOKEN;
@@ -24,13 +25,20 @@ export async function POST(request: Request) {
     }
 
     const text = await file.text();
-    const csvRows = ynabReadyToJson(text);
+    const parsed = ynabReadyToJson(text);
+    const hasOrderId = parsed.some((r) => (r.OrderId ?? "").trim() !== "");
+    const deduped = hasOrderId ? parsed : dedupeYnabReadyRows(parsed);
+    const csvRows = deduped.filter((r) => Math.round(r.Amount * 1000) !== 0);
+    const skippedWithinFile = parsed.length - deduped.length;
+    const skippedZeroAmount = deduped.length - csvRows.length;
 
     if (csvRows.length === 0) {
       return NextResponse.json({
         imported: 0,
         skippedDuplicates: 0,
-        error: "No valid rows in CSV",
+        skippedWithinFile,
+        skippedZeroAmount,
+        error: parsed.length === 0 ? "No valid rows in CSV" : "All rows were duplicates or zero amount",
       });
     }
 
@@ -52,28 +60,40 @@ export async function POST(request: Request) {
       (a, r) => (r.Date < a ? r.Date : a),
       csvRows[0].Date
     );
-    const sinceDate = new Date(minDate);
-    sinceDate.setDate(sinceDate.getDate() - DAYS_TOLERANCE);
-
-    // Fetch existing transactions
-    const existingRes = await api.transactions.getTransactionsByAccount(
-      budgetId,
-      accountId,
-      sinceDate.toISOString().slice(0, 10)
-    );
+    let sinceDateStr = new Date(minDate).toISOString().slice(0, 10);
+    const sinceStart = new Date(minDate);
+    sinceStart.setDate(sinceStart.getDate() - DAYS_TOLERANCE);
+    sinceDateStr = sinceStart.toISOString().slice(0, 10);
 
     const existingByAmount: Record<number, string[]> = {};
-    for (const tx of existingRes.data.transactions || []) {
-      if (tx.amount == null || !tx.date) continue;
-      const dt = typeof tx.date === "string" ? tx.date.slice(0, 10) : "";
-      if (!dt) continue;
-      if (!existingByAmount[tx.amount]) existingByAmount[tx.amount] = [];
-      existingByAmount[tx.amount].push(dt);
+    while (true) {
+      const existingRes = await api.transactions.getTransactionsByAccount(
+        budgetId,
+        accountId,
+        sinceDateStr
+      );
+      const txs = existingRes.data.transactions || [];
+      for (const tx of txs) {
+        if (tx.deleted || tx.amount == null || !tx.date) continue;
+        const dt = typeof tx.date === "string" ? tx.date.slice(0, 10) : "";
+        if (!dt) continue;
+        if (!existingByAmount[tx.amount]) existingByAmount[tx.amount] = [];
+        existingByAmount[tx.amount].push(dt);
+      }
+      if (txs.length < PAGE_SIZE || txs.length === 0) break;
+      let latest = "";
+      for (const tx of txs) {
+        const d = typeof tx.date === "string" ? tx.date.slice(0, 10) : "";
+        if (d && d > latest) latest = d;
+      }
+      if (!latest) break;
+      const next = new Date(latest);
+      next.setDate(next.getDate() + 1);
+      sinceDateStr = next.toISOString().slice(0, 10);
     }
 
-    function isDuplicate(importDate: string, importAmount: number): boolean {
-      const amt = Math.round(importAmount * 1000);
-      const dates = existingByAmount[amt];
+    function isDuplicate(importDate: string, amountMilli: number): boolean {
+      const dates = existingByAmount[amountMilli];
       if (!dates) return false;
       const imp = new Date(importDate);
       for (const d of dates) {
@@ -84,40 +104,85 @@ export async function POST(request: Request) {
       return false;
     }
 
+    // Group by OrderId when present; else each row is its own group
+    const groups = new Map<string, typeof csvRows>();
+    for (const row of csvRows) {
+      const key = row.OrderId?.trim()
+        ? row.OrderId.trim()
+        : `${row.Date}|${Math.round(row.Amount * 1000)}|${(row.Memo || "").slice(0, 60)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(row);
+    }
+
     const transactions: ynab.NewTransaction[] = [];
     let skippedDuplicates = 0;
 
-    for (const row of csvRows) {
-      const amountMilli = Math.round(row.Amount * 1000);
-      const dateObj = new Date(row.Date);
-      const dateStr = dateObj.toISOString().slice(0, 10);
-
-      if (isDuplicate(row.Date, row.Amount)) {
+    for (const [, groupRows] of groups) {
+      const first = groupRows[0];
+      const dateStr = new Date(first.Date).toISOString().slice(0, 10);
+      const totalMilli = groupRows.reduce((s, r) => s + Math.round(r.Amount * 1000), 0);
+      if (totalMilli === 0) continue;
+      if (isDuplicate(first.Date, totalMilli)) {
         skippedDuplicates++;
         continue;
       }
 
-      const categoryId =
-        row.Category && categoryIdMap[row.Category.toLowerCase()]
-          ? categoryIdMap[row.Category.toLowerCase()]
-          : null;
+      const payee = first.Payee?.trim() || "Amazon.ca";
+      const memo = first.Memo?.trim().slice(0, 500) || null;
 
-      transactions.push({
-        account_id: accountId,
-        date: dateStr,
-        amount: amountMilli,
-        payee_name: row.Payee || "Amazon.ca",
-        memo: row.Memo || null,
-        category_id: categoryId,
-        cleared: "uncleared",
-        approved: false,
-      });
+      // Aggregate by category (category_id -> sum milli)
+      const catAmounts = new Map<string | null, number>();
+      for (const row of groupRows) {
+        const cid =
+          row.Category && categoryIdMap[row.Category.toLowerCase()]
+            ? categoryIdMap[row.Category.toLowerCase()]
+            : null;
+        const amt = Math.round(row.Amount * 1000);
+        catAmounts.set(cid, (catAmounts.get(cid) ?? 0) + amt);
+      }
+
+      const importId = `YNAB:${totalMilli}:${dateStr}:1`;
+
+      if (catAmounts.size === 1) {
+        const onlyCatId = catAmounts.keys().next().value ?? null;
+        transactions.push({
+          account_id: accountId,
+          date: dateStr,
+          amount: totalMilli,
+          payee_name: payee,
+          memo,
+          category_id: onlyCatId,
+          cleared: "uncleared",
+          approved: false,
+          import_id: importId,
+        });
+      } else {
+        const subtransactions = Array.from(catAmounts.entries()).map(([category_id, amount]) => ({
+          amount,
+          category_id,
+          memo: null as string | null,
+        }));
+        transactions.push({
+          account_id: accountId,
+          date: dateStr,
+          amount: totalMilli,
+          payee_name: payee,
+          memo: memo || `Order ${dateStr} (split)`,
+          category_id: null,
+          cleared: "uncleared",
+          approved: false,
+          import_id: importId,
+          subtransactions,
+        });
+      }
     }
 
     if (transactions.length === 0) {
       return NextResponse.json({
         imported: 0,
         skippedDuplicates,
+        skippedWithinFile,
+        skippedZeroAmount,
         existingLoaded: Object.values(existingByAmount).flat().length,
       });
     }
@@ -132,6 +197,8 @@ export async function POST(request: Request) {
     return NextResponse.json({
       imported: created,
       skippedDuplicates,
+      skippedWithinFile,
+      skippedZeroAmount,
       apiDuplicates,
       existingLoaded: Object.values(existingByAmount).flat().length,
     });

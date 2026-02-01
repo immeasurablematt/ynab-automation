@@ -1,6 +1,6 @@
 # YNAB transaction import (with categories)
 
-**Fastest path (Amazon orders):** See [OPTION_A_INSTRUCTIONS.md](OPTION_A_INSTRUCTIONS.md) for using the Chrome extension + normalizer script.
+**Fastest path (Amazon orders):** See [OPTION_A_INSTRUCTIONS.md](OPTION_A_INSTRUCTIONS.md) for the Chrome extension + normalizer workflow.
 
 Import CSV transactions into You Need A Budget with **categories assigned** via the official YNAB API.
 
@@ -49,8 +49,12 @@ python get_ynab_ids.py
 # 4) Edit CATEGORY_MAPPING in ynab_import.py
 
 # Import
-python ynab_import.py
+YNAB_CSV_FILE=amazon_ynab_ready.csv python ynab_import.py
 ```
+
+**Other scripts:**
+- `ynab_apply_csv_categories.py` — Match existing YNAB transactions to your CSV and fix Uncategorized
+- `ynab_cleanup_amazon.py` — Remove duplicates and verify categories in the Amazon account
 
 ## Security
 

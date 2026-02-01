@@ -16,6 +16,8 @@ const CATEGORY_KEYWORDS: [string, string[]][] = [
 const DATE_COLS = ["order.date", "order date", "order_date", "date", "order placed", "charged on"];
 const AMOUNT_COLS = ["order.total", "order total", "order_total", "item total", "item.total", "total", "amount", "price"];
 const MEMO_COLS = ["item.title", "item title", "item_title", "title", "product", "description", "item", "memo", "order.items"];
+const ORDER_ID_COLS = ["order id", "order number", "order_id", "orderid"];
+const ORDER_TOTAL_COLS = ["order.total", "order total", "order_total"];
 
 function findColumn(keys: string[], candidates: string[]): string | null {
   const lower = Object.fromEntries(keys.map((k) => [k.trim().toLowerCase(), k]));
@@ -65,6 +67,7 @@ export interface CsvRow {
   Memo: string;
   Amount: number;
   Category: string;
+  OrderId?: string;
 }
 
 import { parse } from "csv-parse/sync";
@@ -87,6 +90,8 @@ export function normalizeAmazonCsv(csvText: string, noCategory = false): CsvRow[
   const dateCol = findColumn(keys, DATE_COLS);
   const amountCol = findColumn(keys, AMOUNT_COLS);
   const memoCol = findColumn(keys, MEMO_COLS);
+  const orderIdCol = findColumn(keys, ORDER_ID_COLS);
+  const orderTotalCol = findColumn(keys, ORDER_TOTAL_COLS);
 
   if (!dateCol || !amountCol) return [];
 
@@ -107,6 +112,14 @@ export function normalizeAmazonCsv(csvText: string, noCategory = false): CsvRow[
     if (seen.has(key)) continue;
     seen.add(key);
 
+    let orderId: string | undefined;
+    if (orderIdCol && (row[orderIdCol] ?? "").toString().trim()) {
+      orderId = (row[orderIdCol] ?? "").toString().trim();
+    } else if (orderTotalCol) {
+      const orderTotal = parseAmount(row[orderTotalCol]);
+      orderId = orderTotal != null ? `${dateStr}|${orderTotal}` : undefined;
+    }
+
     const category = noCategory ? "" : categorize(memoStr);
     out.push({
       Date: dateStr,
@@ -114,6 +127,7 @@ export function normalizeAmazonCsv(csvText: string, noCategory = false): CsvRow[
       Memo: memoStr || `Order ${dateStr}`,
       Amount: amountYnab,
       Category: category,
+      ...(orderId != null ? { OrderId: orderId } : {}),
     });
   }
 
@@ -123,18 +137,37 @@ export function normalizeAmazonCsv(csvText: string, noCategory = false): CsvRow[
 export function ynabReadyToJson(csvText: string): CsvRow[] {
   const rows = parseCsv(csvText);
   const out: CsvRow[] = [];
+  const hasOrderId = rows.length > 0 && "OrderId" in rows[0];
   for (const row of rows) {
     const dateStr = (row.Date ?? "").trim();
     const amountStr = (row.Amount ?? "0").replace(/,/g, "");
-    const amount = parseFloat(amountStr);
+    let amount = parseFloat(amountStr);
     if (!dateStr || isNaN(amount)) continue;
-    out.push({
+    if (amount > 0) amount = -amount;
+    const csvRow: CsvRow = {
       Date: dateStr,
       Payee: (row.Payee ?? "Amazon.ca").trim(),
       Memo: (row.Memo ?? "").trim().slice(0, 500),
       Amount: amount,
       Category: (row.Category ?? "Uncategorized").trim(),
-    });
+    };
+    if (hasOrderId && (row.OrderId ?? "").toString().trim()) {
+      csvRow.OrderId = (row.OrderId ?? "").toString().trim();
+    }
+    out.push(csvRow);
+  }
+  return out;
+}
+
+export function dedupeYnabReadyRows(rows: CsvRow[]): CsvRow[] {
+  const seen = new Set<string>();
+  const out: CsvRow[] = [];
+  for (const row of rows) {
+    const milli = Math.round(row.Amount * 1000);
+    const key = `${row.Date}|${milli}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
   }
   return out;
 }

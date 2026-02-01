@@ -11,9 +11,9 @@ export async function POST(request: Request) {
     const text = await file.text();
     const rows = normalizeAmazonCsv(text);
     const csv = [
-      "Date,Payee,Memo,Amount,Category",
+      "Date,Payee,Memo,Amount,Category,OrderId",
       ...rows.map((r) =>
-        [r.Date, r.Payee, `"${(r.Memo || "").replace(/"/g, '""')}"`, r.Amount, r.Category].join(",")
+        [r.Date, r.Payee, `"${(r.Memo || "").replace(/"/g, '""')}"`, r.Amount, r.Category, r.OrderId ?? ""].join(",")
       ),
     ].join("\n");
     return new NextResponse(csv, {

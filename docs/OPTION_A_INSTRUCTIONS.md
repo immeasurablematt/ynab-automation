@@ -37,14 +37,14 @@ python3 amazon_csv_to_ynab.py ~/Downloads/amazon_orders_2025.csv
 Optional flags:
 
 - `-o output.csv` – custom output filename (default: `amazon_ynab_ready.csv`)
-- `--no-category` – skip auto-categorization; all rows will have blank Category
+- `--no-ai` – skip AI categorization; all rows will be Uncategorized
 
 The script will:
 
 - Detect date, amount, and memo columns (supports both Orders and Items CSV).
 - Normalize dates to YYYY-MM-DD.
 - Use negative amounts for spending and positive for refunds.
-- Assign categories from your Budget-ta 2.0 list based on item descriptions.
+- **AI categorization:** Uses Claude to understand each product and pick the right budget category (requires `ANTHROPIC_API_KEY` in `.env`).
 
 ## 4. Review the output
 
@@ -76,7 +76,7 @@ The extension’s CSV format may have changed. Share the first few lines (header
 - **Items CSV**: one transaction per item (multiple rows per order). If you want one per order, use the Orders CSV.
 
 **Category wrong or blank**  
-Edit the CSV manually, or add keyword rules in `amazon_csv_to_ynab.py` in the `CATEGORY_KEYWORDS` list.
+Edit the CSV manually. AI uses your YNAB categories; ensure `YNAB_ACCESS_TOKEN` and `YNAB_BUDGET_ID` are set so it fetches your actual category list.
 
 **Extension doesn’t work on Amazon.ca**  
 The extension supports Amazon.ca. If it fails, try: clear Amazon cookies, sign in again, and run the export with only one Amazon tab open.

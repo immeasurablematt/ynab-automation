@@ -7,6 +7,7 @@ Skips duplicates: same amount, date within +/- DAYS_TOLERANCE of an existing tra
 import csv
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 try:
@@ -66,8 +67,8 @@ def main():
             print(f"Error fetching categories: {e}")
             sys.exit(1)
 
-        # First pass: read CSV rows to get date range for duplicate check
-        csv_rows = []
+        # First pass: read CSV rows; support optional OrderId for grouping (splits)
+        raw_rows = []
         min_csv_date = None
         max_csv_date = None
         with open(CSV_FILE, mode="r", encoding="utf-8-sig") as f:
@@ -85,36 +86,72 @@ def main():
                         continue
                 amount_str = row.get("Amount", "0").strip().replace(",", "")
                 try:
-                    amount = int(float(amount_str) * 1000)
+                    raw = float(amount_str)
+                    amount = int(round(raw * 1000))
+                    if amount > 0:
+                        amount = -amount
                 except ValueError:
                     continue
-                csv_rows.append((date_obj, amount, row))
+                if amount == 0:
+                    continue
+                order_id = (row.get("OrderId") or "").strip()
+                raw_rows.append((date_obj, amount, row, order_id))
                 if min_csv_date is None or date_obj < min_csv_date:
                     min_csv_date = date_obj
                 if max_csv_date is None or date_obj > max_csv_date:
                     max_csv_date = date_obj
 
-        # Fetch existing transactions for duplicate check
+        # Group by OrderId (when present); else each row is its own group
+        groups = defaultdict(list)
+        for date_obj, amount, row, order_id in raw_rows:
+            if order_id:
+                groups[order_id].append((date_obj, amount, row))
+            else:
+                groups[f"{date_obj}|{amount}|{(row.get('Memo') or '')[:60]}"].append((date_obj, amount, row))
+
+        # Fetch existing transactions for duplicate check (paginate if API returns many)
         existing_by_amount = {}  # amount -> [date, ...]
+        PAGE_SIZE = 500
         if min_csv_date is not None:
             since = (min_csv_date - timedelta(days=DAYS_TOLERANCE)).isoformat()
             try:
-                existing_response = transactions_api.get_transactions_by_account(
-                    BUDGET_ID, ACCOUNT_ID, since_date=since
-                )
-                for tx in (existing_response.data.transactions or []):
-                    amt = tx.amount
-                    tx_date = getattr(tx, "var_date", None) or getattr(tx, "date", None)
-                    if tx_date is None:
-                        continue
-                    dt_str = tx_date.isoformat() if hasattr(tx_date, "isoformat") else str(tx_date)
-                    try:
-                        dt_obj = datetime.strptime(dt_str[:10], "%Y-%m-%d").date()
-                    except (ValueError, TypeError):
-                        continue
-                    if amt not in existing_by_amount:
-                        existing_by_amount[amt] = []
-                    existing_by_amount[amt].append(dt_obj)
+                while True:
+                    existing_response = transactions_api.get_transactions_by_account(
+                        BUDGET_ID, ACCOUNT_ID, since_date=since
+                    )
+                    txs = existing_response.data.transactions or []
+                    for tx in txs:
+                        if getattr(tx, "deleted", False):
+                            continue
+                        amt = tx.amount
+                        tx_date = getattr(tx, "var_date", None) or getattr(tx, "date", None)
+                        if tx_date is None:
+                            continue
+                        dt_str = tx_date.isoformat() if hasattr(tx_date, "isoformat") else str(tx_date)
+                        try:
+                            dt_obj = datetime.strptime(dt_str[:10], "%Y-%m-%d").date()
+                        except (ValueError, TypeError):
+                            continue
+                        if amt not in existing_by_amount:
+                            existing_by_amount[amt] = []
+                        existing_by_amount[amt].append(dt_obj)
+                    if len(txs) < PAGE_SIZE or not txs:
+                        break
+                    latest = None
+                    for tx in txs:
+                        tx_date = getattr(tx, "var_date", None) or getattr(tx, "date", None)
+                        if tx_date is None:
+                            continue
+                        dt_str = tx_date.isoformat() if hasattr(tx_date, "isoformat") else str(tx_date)
+                        try:
+                            dt_obj = datetime.strptime(dt_str[:10], "%Y-%m-%d").date()
+                        except (ValueError, TypeError):
+                            continue
+                        if latest is None or dt_obj > latest:
+                            latest = dt_obj
+                    if latest is None:
+                        break
+                    since = (latest + timedelta(days=1)).isoformat()
                 print(f"Loaded {sum(len(v) for v in existing_by_amount.values())} existing transaction(s) for duplicate check.")
             except ApiException as e:
                 print(f"Warning: Could not fetch existing transactions for duplicate check: {e}")
@@ -127,39 +164,73 @@ def main():
                     return True
             return False
 
-        # Build list of NewTransaction, skipping duplicates
+        def category_for_row(row):
+            row_category = (row.get("Category") or "").strip()
+            if row_category:
+                return category_id_map.get(row_category.lower()), row_category
+            payee_lower = (row.get("Payee") or "").strip().lower()
+            name = CATEGORY_MAPPING.get(payee_lower, DEFAULT_CATEGORY_NAME)
+            return category_id_map.get(name.lower()) if name else None, name
+
+        # Build list of NewTransaction (single or split) per group, skipping duplicates
         transactions_to_import = []
         skipped_duplicates = 0
-        for date_obj, amount, row in csv_rows:
-            if is_duplicate(date_obj, amount):
+        for _key, group_rows in groups.items():
+            date_obj = group_rows[0][0]
+            total_amount = sum(r[1] for r in group_rows)
+            if total_amount == 0:
+                continue
+            if is_duplicate(date_obj, total_amount):
                 skipped_duplicates += 1
                 continue
 
-            payee = (row.get("Payee") or "").strip()
-            memo = (row.get("Memo") or "").strip()[:500]
+            payee = (group_rows[0][2].get("Payee") or "").strip() or "Amazon.ca"
+            memo = (group_rows[0][2].get("Memo") or "").strip()[:500]
 
-            # Use per-row Category column if present and non-empty; else payee mapping
-            row_category = (row.get("Category") or "").strip()
-            if row_category:
-                category_name = row_category
-            else:
-                payee_lower = payee.lower()
-                category_name = CATEGORY_MAPPING.get(payee_lower, DEFAULT_CATEGORY_NAME)
-            category_id = category_id_map.get(category_name.lower()) if category_name else None
-            if category_name and not category_id:
-                print(f"Warning: Category '{category_name}' not found for payee '{payee}'. Leaving uncategorized.")
+            # Aggregate by category (category_id -> sum of amounts in milliunits)
+            cat_amounts = defaultdict(int)
+            for _d, amt, row in group_rows:
+                cat_id, cat_name = category_for_row(row)
+                if cat_name and not cat_id:
+                    print(f"Warning: Category '{cat_name}' not found. Leaving uncategorized.")
+                cat_amounts[cat_id] += amt
 
-            tx = ynab.NewTransaction(
-                account_id=ACCOUNT_ID,
-                date=date_obj,
-                amount=amount,
-                payee_name=payee or None,
-                memo=memo or None,
-                category_id=category_id,
-                cleared="uncleared",
-                approved=False,
-            )
-            transactions_to_import.append(tx)
+            if len(cat_amounts) == 1:
+                # Single category (including uncategorized): one transaction
+                only_cat_id = next(iter(cat_amounts.keys()))
+                import_id = f"YNAB:{total_amount}:{date_obj.isoformat()}:1"
+                tx = ynab.NewTransaction(
+                    account_id=ACCOUNT_ID,
+                    date=date_obj,
+                    amount=total_amount,
+                    payee_name=payee or None,
+                    memo=memo or None,
+                    category_id=only_cat_id,
+                    cleared="uncleared",
+                    approved=False,
+                    import_id=import_id,
+                )
+                transactions_to_import.append(tx)
+            elif len(cat_amounts) > 1:
+                # Multiple categories: split transaction
+                subtransactions = []
+                for cid, camt in cat_amounts.items():
+                    subtransactions.append(ynab.SaveSubTransaction(amount=camt, category_id=cid, memo=None))
+                import_id = f"YNAB:{total_amount}:{date_obj.isoformat()}:1"
+                split_memo = memo or f"Order {date_obj.isoformat()} (split)"
+                tx = ynab.NewTransaction(
+                    account_id=ACCOUNT_ID,
+                    date=date_obj,
+                    amount=total_amount,
+                    payee_name=payee or None,
+                    memo=split_memo[:500],
+                    category_id=None,
+                    cleared="uncleared",
+                    approved=False,
+                    import_id=import_id,
+                    subtransactions=subtransactions,
+                )
+                transactions_to_import.append(tx)
 
         if skipped_duplicates:
             print(f"Skipped {skipped_duplicates} duplicate(s) (same amount, date within ±{DAYS_TOLERANCE} days).")
